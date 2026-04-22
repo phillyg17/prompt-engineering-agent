@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.env
+
+# macOS
+.DS_Store
+
+# VS Code
+.vscode/
+
+# Office documents
+*.docx
+greeting.docx
+
+# Logs
+*.log
