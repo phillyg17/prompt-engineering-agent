@@ -1,0 +1,185 @@
+PROMPT ENGINEERING AGENT — SUMMARY
+================================================================================
+
+OVERVIEW
+--------
+This is a LangGraph-powered multi-agent system that automatically writes and
+refines LLM prompts until they meet a quality threshold. It connects to a local
+Ollama server (default model: gemini-3-flash-preview:cloud) and optionally
+ingests PDF/Word documents from a context/ folder to enrich the prompts with
+real-world reference material.
+
+The system runs in a loop: a Writer agent generates a prompt, a Critic agent
+evaluates it across 5 tests on 3 dimensions, and if any score is below 3.0 the
+Writer rewrites it using feedback. The loop continues until all scores are >= 3.0
+or a max iteration limit is hit.
+
+
+ARCHITECTURE — GRAPH FLOW
+-------------------------
+The agent is structured as a LangGraph state machine:
+
+    ┌──────────────┐
+    │ File Scanner │  ← lists all .pdf / .docx files in context/
+    └──────┬───────┘
+           │
+           ▼
+    ┌──────────────┐
+    │   Router     │  ← LLM picks which files are relevant to the request
+    └──────┬───────┘
+           │
+           ▼
+    ┌──────────────┐
+    │ Doc Loader   │  ← parses only selected files into plain text
+    └──────┬───────┘
+           │
+           ▼
+    ┌──────────────┐
+    │    Writer    │  ← generates prompt from user context + document text
+    └──────┬───────┘
+           │
+           ▼
+    ┌──────────────┐
+    │   Critic     │  ← grades prompt on clarity, specificity, predictability
+    └──────┬───────┘
+           │
+           ▼ should_continue()
+        ┌──────┬──────────┐
+        │ Pass │   Fail   │
+        │  ▼   │    ▼     │
+        │ END  │ → Writer │
+        └──────┴──────────┘
+
+
+STATE (shared across all nodes)
+-------------------------------
+The graph passes a single typed dictionary (AgentState) between nodes:
+
+- user_context      — text the user typed via CLI --context flag
+- available_files   — all .pdf /.docx filenames found in context/
+- selected_files    — subset chosen by the Router
+- doc_context       — combined plain text extracted from selected files
+- current_prompt    — the actual prompt being written/refined
+- iteration         — how many rewrite cycles have happened
+- scores            — aggregated {clarity, specificity, output_predictability}
+- logs              — human-readable score lines for terminal output
+- done              — loop control flag
+
+
+NODES / AGENTS
+---------------
+
+1. FILE SCANNER (deterministic)
+   Scans BASE_DIR/context/ and records every .pdf and .docx filename. If the
+directory doesn't exist it returns an empty list and the pipeline skips
+ document ingestion.
+
+2. ROUTER (LLM-powered)
+   Receives the user's written context + a list of available files. It returns
+a JSON object {"selected_files": ["..."]} choosing which files are relevant.
+   Safety features:
+   - If only 1 file exists → auto-selects it (no LLM call)
+   - If LLM returns nonsense or empty list → falls back to ALL files
+   - Unknown filenames are silently filtered out
+
+3. DOCUMENT LOADER (deterministic, uses tools)
+   For each selected file, dispatches to read_pdf or read_docx based on
+suffix. Extracted text is concatenated into the doc_context field.
+   Logging includes character counts and zero-byte warnings.
+
+4. WRITER (LLM-powered)
+   Receives both user_context and doc_context merged into one block.
+   On iteration 0: generates the first draft.
+   On rewrites: also receives previous_prompt + instructions to address
+   weaknesses from the critic.
+
+5. CRITIC (LLM-powered, 5 runs + execution testing)
+   Before scoring, the critic runs two major sub-processes:
+
+   a) Dummy Input Generation  (_generate_dummy_input)
+      An LLM call synthesizes realistic test data matching the prompt's domain.
+
+   b) Execution Testing  (run_prompt_test tool)
+      An LLM call (temperature=0.3) executes the prompt against the dummy input.
+      This is done TWICE with the SAME input to check output consistency.
+      Results are fed into the scoring messages.
+
+   Then, for each of the 5 tests, the LLM receives:
+   - Combined context
+   - The prompt under evaluation
+   - Execution evidence (dummy input, both outputs, consistency note)
+   - A system prompt with detailed 1-5 rubrics per dimension
+   - Instructions to reason first (2-4 sentences) THEN output JSON
+
+   The reasoning text appears before the JSON in the response, but
+   _extract_json() pulls only the first JSON object, so reasoning is
+   naturally discarded during parsing.
+
+   Scores 1-5 are clamped and averaged per dimension.
+
+6. CONDITIONAL EDGE (should_continue)
+   - Iteration >= MAX_ITERATIONS → END
+   - All three scores >= SCORE_THRESHOLD (3.0) → END
+   - Otherwise → loop back to Writer
+
+
+TOOLS (with @tool decorator)
+-----------------------------
+read_pdf(path)       → Extract plain text from a PDF via pypdf
+read_docx(path)      → Extract plain text from a Word doc via python-docx
+run_prompt_test(...) → Execute a prompt against dummy input with a
+                       separate LLM instance (temperature=0.3) and return
+                       the raw output.
+
+Note: read_pdf / read_docx have plain implementations
+(read_pdf_impl / read_docx_impl) called both by the @tool wrappers and
+ directly inside the doc_loader node.
+
+
+DOCUMENT CONTEXT
+----------------
+Drop PDF or Word documents into the context/ folder at script level. You do
+NOT need to modify code. The Router will decide which files are relevant, and
+ the Doc Loader will merge them into the prompt context automatically.
+
+Supported formats: .pdf, .docx
+
+
+CONFIGURATION (environment variables)
+-------------------------------------
+PROMPT_AGENT_MODEL        default: gemini-3-flash-preview:cloud
+OLLAMA_BASE_URL            default: http://localhost:11434
+PROMPT_AGENT_MAX_ITER      default: 10
+
+
+HOW TO RUN
+----------
+$ cd prompt-engineering-agent
+$ source venv/bin/activate
+$ export OLLAMA_BASE_URL=http://localhost:11434
+$ python prompt_agent.py --context "A prompt that extracts meeting action items"
+
+Interactive mode (press Enter at prompt for documents-only):
+$ python prompt_agent.py
+> A prompt that generates a project roadmap
+
+FILES IN THE PROJECT
+--------------------
+prompt_agent.py       — main script (LangGraph, all agents, tools)
+requirements.txt      — Python dependencies
+context/              — folder for your PDF/DOCX reference documents
+README.md             — user-facing documentation
+summary.txt           — this file
+
+DEPENDENCIES
+------------
+langgraph, langchain, langchain-ollama, pydantic, pypdf, python-docx
+
+WHAT THIS SYSTEM DOES WELL
+-----------------------------
+- Eliminates hand-tuning of prompts by automating critique → rewrite loops
+- Reads real documents so prompts can reflect actual domain content
+- Intelligent routing avoids token bloat when many documents are present
+- Empirical execution testing means predictability is grounded in observed
+  LLM behavior, not guesswork
+- Rubric-driven 1-5 scoring with reasoning reduces binary 1/5 clustering
