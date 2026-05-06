@@ -21,10 +21,13 @@ greeting.docx
 # Logs
 *.log
 
-# Excluded folders
-prompts/
-transcripts/
-truth data/
+# Excluded folders (track folder only, not contents)
+prompts/*
+!prompts/.gitkeep
+transcripts/*
+!transcripts/.gitkeep
+truth data/*
+!truth data/.gitkeep
 
 # Excluded files
 summary.txt
