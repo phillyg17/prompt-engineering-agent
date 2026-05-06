@@ -21,6 +21,11 @@ greeting.docx
 # Logs
 *.log
 
+# Excluded folders
+prompts/
+transcripts/
+truth data/
+
 # Excluded files
 summary.txt
 prompt.txt
