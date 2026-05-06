@@ -20,3 +20,8 @@ greeting.docx
 
 # Logs
 *.log
+
+# Excluded files
+summary.txt
+prompt.txt
+TODO.md

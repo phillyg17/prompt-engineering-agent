@@ -8,22 +8,28 @@ Flow:
 3. Router agent (LLM-powered) decides which files are relevant to the user's request.
 4. Document Loader node parses only the selected files via tools.
 5. Writer agent generates a prompt using written context + extracted document text.
-6. Critic agent evaluates the prompt across 5 independent tests.
-   For each test it grades clarity, specificity, and output predictability (1-5).
-   Scores are aggregated (averaged) per dimension.
+6. Critic agent evaluates the prompt on 3 dimensions: clarity, specificity, and
+   output predictability (1-5 scale). If no truth data exists in test_data/,
+   the critic also generates dummy input and runs an execution test against the
+   prompt to observe real LLM output.
 7. If any dimension scores < 3, the writer rewrites the prompt using critique feedback.
-8. Loop continues until all dimensions >= 3 or a max iteration limit is reached.
+8. When all dimensions >= 3, the Tester node validates the prompt against truth data
+   from test_data/ (if JSON files are present), running the prompt against real
+   transcripts and comparing output scores to expected results.
+9. Loop continues until all dimensions >= 3 or a max iteration limit is reached.
 """
 
 import json
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Dict, List, TypedDict
 
 from langgraph.graph import StateGraph, END
 from langchain_ollama import ChatOllama
+from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.tools import tool
 
@@ -43,17 +49,85 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
 CONTEXT_DIR = BASE_DIR / "context"
+TEST_DATA_DIR = BASE_DIR / "test data"
 
-MODEL_NAME = os.getenv("PROMPT_AGENT_MODEL", "qwen3.5:397b-cloud")
+MODEL_NAME = os.getenv("PROMPT_AGENT_MODEL", "gemma4:31b-cloud")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 MAX_ITERATIONS = int(os.getenv("PROMPT_AGENT_MAX_ITER", "10"))
 SCORE_THRESHOLD = 3.0
-NUM_TESTS = 5
+NUM_TESTS = 1
+
+# Transcript placeholder inserted at the end of every generated prompt
+TRANSCRIPT_PLACEHOLDER = "{{insert transcript here}}"
+TRANSCRIPT_TEMPLATE = f"\n\nTRANSCRIPT:\n{TRANSCRIPT_PLACEHOLDER}"
+
+def _has_truth_data() -> bool:
+    """Return True if test_data/ directory exists and contains at least one JSON file."""
+    if not TEST_DATA_DIR.exists():
+        return False
+    for f in TEST_DATA_DIR.iterdir():
+        if f.is_file() and f.suffix.lower() == ".json":
+            return True
+    return False
+LLAMA_SERVER_URL = "http://127.0.0.1:8080"
+LLAMA_SERVER_MODEL = "Qwen3.6-35B-A3B-UD-Q6_K_XL"
 
 # ---------------------------------------------------------------------------
 # LLM setup
 # ---------------------------------------------------------------------------
 llm = ChatOllama(model=MODEL_NAME, base_url=OLLAMA_BASE_URL, temperature=0.7)
+
+# Module-level flag shared with tools that create their own LLM instances
+_use_fallback = False
+
+
+# ---------------------------------------------------------------------------
+# Fallback-aware LLM factory
+# ---------------------------------------------------------------------------
+def get_llm(state: AgentState):
+    """Return the appropriate LLM instance based on fallback state.
+
+    Returns llama-server ChatOpenAI if llm_fallback is True, otherwise Ollama.
+    """
+    global _use_fallback
+    if state.get("llm_fallback", False):
+        _use_fallback = True
+        return ChatOpenAI(
+            model=LLAMA_SERVER_MODEL,
+            base_url=f"{LLAMA_SERVER_URL}/v1",
+            temperature=0.7,
+            api_key="",
+        )
+    _use_fallback = False
+    return llm
+
+
+def try_llama_server(state: AgentState) -> AgentState:
+    """Probe Ollama with a lightweight call. If it fails, switch to llama-server.
+
+    This is lazy — called on first need (writer node). Once Ollama fails,
+    llm_fallback=True persists through the entire graph execution.
+    """
+    global _use_fallback
+    if state.get("llm_fallback", False):
+        # Already switched, no need to probe again
+        _use_fallback = True
+        return state
+
+    try:
+        probe_llm = ChatOllama(model=MODEL_NAME, base_url=OLLAMA_BASE_URL, temperature=0)
+        probe_llm.invoke([HumanMessage(content="ok")])
+        # Ollama responded — all good
+    except Exception as exc:
+        logger.warning(
+            "Ollama probe failed (%s). Switching to llama-server fallback at %s.",
+            exc,
+            LLAMA_SERVER_URL,
+        )
+        _use_fallback = True
+        return {**state, "llm_fallback": True}
+
+    return state
 
 
 # ---------------------------------------------------------------------------
@@ -69,6 +143,8 @@ class AgentState(TypedDict):
     scores: Dict[str, float]
     logs: List[str]
     done: bool
+    tester_results: Dict[str, object]
+    llm_fallback: bool  # True once Ollama has failed and we've switched to llama-server
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +218,15 @@ def run_prompt_test(prompt: str, dummy_input: str) -> str:
         HumanMessage(content=human_msg),
     ]
     # Use a lower temperature for more deterministic test outputs
-    test_llm = ChatOllama(model=MODEL_NAME, base_url=OLLAMA_BASE_URL, temperature=0.3)
+    if _use_fallback:
+        test_llm = ChatOpenAI(
+            model=LLAMA_SERVER_MODEL,
+            base_url=f"{LLAMA_SERVER_URL}/v1",
+            temperature=0.3,
+            api_key="",
+        )
+    else:
+        test_llm = ChatOllama(model=MODEL_NAME, base_url=OLLAMA_BASE_URL, temperature=0.3)
     response = test_llm.invoke(messages)
     return response.content.strip()
 
@@ -293,7 +377,10 @@ def doc_loader_node(state: AgentState) -> AgentState:
 WRITER_SYSTEM = (
     "You are an expert prompt engineer. Your sole task is to write a single, "
     "self-contained prompt that an LLM can execute. Be detailed, specific, "
-    "and clear. Output ONLY the final prompt text—no markdown fences, no preamble."
+    "and clear. Output ONLY the final prompt text—no markdown fences, no preamble.\n"
+    "IMPORTANT: Do NOT include any transcript placeholder, transcript input section, "
+    "or instructions like 'Transcript to analyze' or 'Insert transcript here' in your output. "
+    "The transcript will be appended automatically after your prompt."
 )
 
 
@@ -315,6 +402,8 @@ def _build_combined_context(state: AgentState) -> str:
 
 def writer_node(state: AgentState) -> AgentState:
     logger.info("--- WRITER NODE ---")
+    # Lazy fallback probe on first need
+    state = try_llama_server(state)
     combined_context = _build_combined_context(state)
     previous_prompt = state.get("current_prompt", "")
     iteration = state["iteration"]
@@ -326,7 +415,11 @@ def writer_node(state: AgentState) -> AgentState:
         lines.append("Write a high-quality general-purpose prompt.\n")
 
     if iteration > 0 and previous_prompt:
-        lines.append(f"Previous prompt (iteration {iteration}):\n{previous_prompt}\n")
+        # Strip transcript template before feeding previous prompt to writer
+        clean_previous = previous_prompt
+        if clean_previous.endswith(TRANSCRIPT_TEMPLATE):
+            clean_previous = clean_previous[:-len(TRANSCRIPT_TEMPLATE)]
+        lines.append(f"Previous prompt (iteration {iteration}):\n{clean_previous}\n")
         lines.append(
             "Rewrite the prompt to address the weaknesses identified by the critic. "
             "Output ONLY the improved prompt."
@@ -343,8 +436,9 @@ def writer_node(state: AgentState) -> AgentState:
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug("===== WRITER PROMPT START =====\n%s\n===== WRITER PROMPT END =====", content[:2000])
 
-    response = llm.invoke(messages)
-    new_prompt = response.content.strip()
+    current_llm = get_llm(state)
+    response = current_llm.invoke(messages)
+    new_prompt = response.content.strip() + TRANSCRIPT_TEMPLATE
 
     logger.info("Writer produced prompt (%d chars):\n%s\n", len(new_prompt), new_prompt)
 
@@ -377,7 +471,8 @@ CRITIC_SYSTEM = (
     "   5: output structure is fully specified; 4: mostly predictable; 3: somewhat predictable but could vary; 2: output shape is unclear; 1: no idea what will come out.\n\n"
     "IMPORTANT: Before giving your final scores, think step by step. "
     "Write 2-4 sentences of reasoning about the prompt's strengths and weaknesses. "
-    "Consider the prompt text AND any execution results provided. "
+    "If execution test results are provided below, use them to inform your evaluation "
+    "(e.g., did the output match the requested format?). "
     "This reasoning will be discarded — only the JSON matters for the final answer.\n\n"
     "Then output a single JSON object and nothing else:\n"
     '{"clarity": int, "specificity": int, "output_predictability": int}'
@@ -400,59 +495,56 @@ def _generate_dummy_input(prompt: str, context: str) -> str:
         SystemMessage(content=system_msg),
         HumanMessage(content=human_msg),
     ]
-    response = llm.invoke(messages)
+    if _use_fallback:
+        dummy_llm = ChatOpenAI(
+            model=LLAMA_SERVER_MODEL,
+            base_url=f"{LLAMA_SERVER_URL}/v1",
+            temperature=0.7,
+            api_key="",
+        )
+    else:
+        dummy_llm = llm
+    response = dummy_llm.invoke(messages)
     return response.content.strip()
 
 
 def critic_node(state: AgentState) -> AgentState:
     logger.info("--- CRITIC NODE ---")
+    # Lazy fallback probe (redundant if writer already ran, but safe)
+    state = try_llama_server(state)
     prompt = state["current_prompt"]
     combined_context = _build_combined_context(state)
     logs = list(state.get("logs", []))
+    current_llm = get_llm(state)
 
-    # --- EXECUTION TESTING ---
-    logger.info("Generating dummy input for execution testing...")
-    try:
-        dummy_input = _generate_dummy_input(prompt, combined_context)
-        logger.info("Dummy input (%d chars): %s", len(dummy_input), dummy_input[:200])
-    except Exception as exc:
-        logger.warning("Failed to generate dummy input: %s. Using fallback.", exc)
-        dummy_input = "This is a sample input for testing purposes."
+    # --- EXECUTION TESTING (only when no truth data exists) ---
+    execution_evidence = ""
+    if not _has_truth_data():
+        logger.info("No truth data found in %s. Generating dummy input for execution testing...", TEST_DATA_DIR)
+        try:
+            dummy_input = _generate_dummy_input(prompt, combined_context)
+            logger.info("Dummy input (%d chars): %s", len(dummy_input), dummy_input[:200])
+        except Exception as exc:
+            logger.warning("Failed to generate dummy input: %s. Using fallback.", exc)
+            dummy_input = "This is a sample input for testing purposes."
 
-    logger.info("Running execution test #1 (prompt + dummy input)...")
-    try:
-        output_1 = run_prompt_test.invoke({"prompt": prompt, "dummy_input": dummy_input})
-        logger.info("Execution output #1 (%d chars): %s", len(output_1), output_1[:200])
-    except Exception as exc:
-        logger.warning("Execution test #1 failed: %s. Skipping execution evidence.", exc)
-        output_1 = "[Execution failed]"
+        logger.info("Running execution test (prompt + dummy input)...")
+        try:
+            output = run_prompt_test.invoke({"prompt": prompt, "dummy_input": dummy_input})
+            logger.info("Execution output (%d chars): %s", len(output), output[:200])
+        except Exception as exc:
+            logger.warning("Execution test failed: %s. Skipping execution evidence.", exc)
+            output = "[Execution failed]"
 
-    logger.info("Running execution test #2 (same input, checking consistency)...")
-    try:
-        output_2 = run_prompt_test.invoke({"prompt": prompt, "dummy_input": dummy_input})
-        logger.info("Execution output #2 (%d chars): %s", len(output_2), output_2[:200])
-    except Exception as exc:
-        logger.warning("Execution test #2 failed: %s. Skipping consistency check.", exc)
-        output_2 = "[Execution failed]"
-
-    # Compare consistency
-    consistency_note = ""
-    if output_1.strip() == output_2.strip():
-        consistency_note = "The two executions with IDENTICAL input produced EXACTLY the same output (high consistency)."
-    elif output_1[:300].strip() == output_2[:300].strip():
-        consistency_note = "The two executions with identical input produced SIMILAR outputs with minor variations (moderate consistency)."
+        execution_evidence = (
+            f"--- EXECUTION TEST RESULTS ---\n"
+            f"Dummy input:\n{dummy_input}\n\n"
+            f"Output:\n{output}\n"
+            f"--- END EXECUTION TESTS ---"
+        )
+        logger.info("Execution testing complete.\n%s", execution_evidence[:500])
     else:
-        consistency_note = "The two executions with identical input produced DIFFERENT outputs (low consistency / non-deterministic)."
-
-    execution_evidence = (
-        f"--- EXECUTION TEST RESULTS ---\n"
-        f"Dummy input used for both runs:\n{dummy_input}\n\n"
-        f"Run 1 output:\n{output_1}\n\n"
-        f"Run 2 output (same input):\n{output_2}\n\n"
-        f"Consistency check: {consistency_note}\n"
-        f"--- END EXECUTION TESTS ---"
-    )
-    logger.info("Execution testing complete.\n%s", execution_evidence[:500])
+        logger.info("Truth data found in %s. Skipping dummy execution tests.", TEST_DATA_DIR)
     # --- END EXECUTION TESTING ---
 
     clarity_scores: List[int] = []
@@ -476,7 +568,7 @@ def critic_node(state: AgentState) -> AgentState:
         ]
 
         try:
-            response = llm.invoke(messages)
+            response = current_llm.invoke(messages)
             scores_obj = _extract_json(response.content)
             c = int(scores_obj["clarity"])
             s = int(scores_obj["specificity"])
@@ -522,6 +614,121 @@ def critic_node(state: AgentState) -> AgentState:
 
 
 # ---------------------------------------------------------------------------
+# Node: Tester
+# ---------------------------------------------------------------------------
+def _format_transcript(transcript: List[dict]) -> str:
+    """Format call_transcript as dialogue lines.
+    
+    Groups consecutive entries by speaker and combines their text.
+    """
+    lines: List[str] = []
+    current_speaker = None
+    current_text_parts: List[str] = []
+
+    for entry in transcript:
+        speaker = entry.get("speaker", "unknown").capitalize()
+        text = entry.get("text", "").strip()
+        if not text:
+            continue
+
+        if speaker == current_speaker:
+            current_text_parts.append(text)
+        else:
+            if current_speaker and current_text_parts:
+                lines.append(f"{current_speaker}: {' '.join(current_text_parts)}")
+            current_speaker = speaker
+            current_text_parts = [text]
+
+    if current_speaker and current_text_parts:
+        lines.append(f"{current_speaker}: {' '.join(current_text_parts)}")
+
+    return "\n".join(lines)
+
+
+def tester_node(state: AgentState) -> AgentState:
+    logger.info("--- TESTER NODE ---")
+
+    # Check for JSON files in test data directory
+    if not TEST_DATA_DIR.exists():
+        logger.info("Test data directory %s does not exist. Skipping tester.", TEST_DATA_DIR)
+        return {**state, "tester_results": {"skipped": True, "reason": "test data directory not found"}}
+
+    json_files = sorted(
+        f.name for f in TEST_DATA_DIR.iterdir()
+        if f.is_file() and f.suffix.lower() == ".json"
+    )
+
+    if not json_files:
+        logger.info("No JSON files found in %s. Skipping tester.", TEST_DATA_DIR)
+        return {**state, "tester_results": {"skipped": True, "reason": "no JSON files found"}}
+
+    # Use the first JSON file found
+    json_file = json_files[0]
+    json_path = TEST_DATA_DIR / json_file
+    logger.info("Loading test data from: %s", json_file)
+
+    try:
+        with open(json_path, "r") as f:
+            truth_data = json.load(f)
+    except Exception as exc:
+        logger.error("Failed to read test data file %s: %s", json_file, exc)
+        return {**state, "tester_results": {"skipped": True, "reason": f"failed to read test data: {exc}"}}
+
+    # Extract truth score
+    truth_score = truth_data.get("score", "")
+    logger.info("Truth score: %s", truth_score)
+
+    # Format the transcript
+    transcript = truth_data.get("call_transcript", [])
+    formatted_transcript = _format_transcript(transcript)
+    logger.info("Formatted transcript (%d chars): %s", len(formatted_transcript), formatted_transcript[:200])
+
+    # Build prompt payload: replace transcript placeholder with formatted transcript
+    prompt = state["current_prompt"]
+    prompt_payload = prompt.replace(TRANSCRIPT_PLACEHOLDER, formatted_transcript)
+
+    logger.info("Running prompt against transcript...")
+    try:
+        tester_llm = get_llm(state)
+        messages = [
+            SystemMessage(content="You are an LLM executing a prompt. Follow the prompt instructions exactly."),
+            HumanMessage(content=prompt_payload),
+        ]
+        response = tester_llm.invoke(messages)
+        prompt_output = response.content.strip()
+    except Exception as exc:
+        logger.error("Failed to run prompt against transcript: %s", exc)
+        return {
+            **state,
+            "tester_results": {
+                "skipped": True,
+                "reason": f"prompt execution failed: {exc}",
+                "truth_score": truth_score,
+                "prompt_output": "",
+                "matches": 0,
+            },
+        }
+
+    logger.info("Prompt output (%d chars): %s", len(prompt_output), prompt_output[:300])
+
+    # Extract score from output using regex (case-insensitive substring match)
+    match = re.search(re.escape(truth_score), prompt_output, re.IGNORECASE)
+    extracted_score = match.group(0) if match else None
+    matches = 1 if extracted_score else 0
+
+    logger.info("Extracted score: %s | Truth score: %s | Match: %s", extracted_score, truth_score, bool(matches))
+
+    return {
+        **state,
+        "tester_results": {
+            "matches": matches,
+            "truth_score": truth_score,
+            "prompt_output": prompt_output,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
 # Conditional edge
 # ---------------------------------------------------------------------------
 def should_continue(state: AgentState) -> str:
@@ -535,8 +742,8 @@ def should_continue(state: AgentState) -> str:
     all_above_threshold = all(score >= SCORE_THRESHOLD for score in scores.values())
 
     if all_above_threshold:
-        logger.info("All scores >= %.1f. Prompt accepted!", SCORE_THRESHOLD)
-        return "__end__"
+        logger.info("All scores >= %.1f. Prompt accepted. Routing to tester.", SCORE_THRESHOLD)
+        return "tester"
     else:
         low_dims = [k for k, v in scores.items() if v < SCORE_THRESHOLD]
         logger.info(
@@ -558,6 +765,7 @@ def build_graph() -> StateGraph:
     workflow.add_node("doc_loader", doc_loader_node)
     workflow.add_node("writer", writer_node)
     workflow.add_node("critic", critic_node)
+    workflow.add_node("tester", tester_node)
 
     workflow.set_entry_point("file_scanner")
     workflow.add_edge("file_scanner", "router")
@@ -569,9 +777,10 @@ def build_graph() -> StateGraph:
         should_continue,
         {
             "writer": "writer",
-            "__end__": END,
+            "tester": "tester",
         },
     )
+    workflow.add_edge("tester", END)
 
     return workflow.compile()
 
@@ -592,6 +801,7 @@ def run(user_context: str) -> AgentState:
         "scores": {},
         "logs": [],
         "done": False,
+        "llm_fallback": False,
     }
 
     logger.info("Starting prompt engineering agent.")
@@ -651,4 +861,16 @@ if __name__ == "__main__":
     print(f"Iterations: {final['iteration']}")
     if final.get("selected_files"):
         print(f"Documents used: {', '.join(final['selected_files'])}")
+    tester_results = final.get("tester_results")
+    if tester_results:
+        print("\n" + "=" * 60)
+        print("TESTER RESULTS")
+        print("=" * 60)
+        if tester_results.get("skipped"):
+            print(f"  Skipped: {tester_results.get('reason', 'unknown')}")
+        else:
+            print(f"  Truth score:  {tester_results['truth_score']}")
+            print(f"  Matches:      {tester_results['matches']}")
+            print(f"  Prompt output:\n{tester_results['prompt_output']}")
+        print("=" * 60)
     print("=" * 60)
